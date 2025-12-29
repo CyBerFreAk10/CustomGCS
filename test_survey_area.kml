@@ -1,0 +1,24 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<kml xmlns="http://www.opengis.net/kml/2.2">
+  <Document>
+    <name>Test Survey Area</name>
+    <description>Sample rectangular survey area for testing</description>
+    <Placemark>
+      <name>Survey Polygon</name>
+      <description>Rectangular area approximately 100m x 80m</description>
+      <Polygon>
+        <outerBoundaryIs>
+          <LinearRing>
+            <coordinates>
+              -122.4200,37.7750,0
+              -122.4190,37.7750,0
+              -122.4190,37.7742,0
+              -122.4200,37.7742,0
+              -122.4200,37.7750,0
+            </coordinates>
+          </LinearRing>
+        </outerBoundaryIs>
+      </Polygon>
+    </Placemark>
+  </Document>
+</kml>
