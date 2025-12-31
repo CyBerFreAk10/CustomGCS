@@ -41,9 +41,6 @@ class CameraSpecs:
             'altitude': altitude_m
         }
 
-# =====================================================
-# LAWNMOWER PATTERN GENERATOR
-# =====================================================
 class LawnmowerPattern:
 
     @staticmethod
@@ -52,25 +49,19 @@ class LawnmowerPattern:
         try:
             tree = ET.parse(file_path)
             root = tree.getroot()
-            
             namespaces = {'kml': 'http://www.opengis.net/kml/2.2'}
             coords = []
             
-            # Try with namespace
             coords_elements = root.findall(".//kml:coordinates", namespaces)
             if not coords_elements:
-                # Try without namespace
                 coords_elements = root.findall(".//coordinates")
             
             for elem in coords_elements:
                 text = elem.text.strip()
                 lines = text.replace('\n', ' ').replace('\r', ' ').split()
-                
                 for line in lines:
                     line = line.strip()
-                    if not line:
-                        continue
-                    
+                    if not line: continue
                     parts = line.split(",")
                     if len(parts) >= 2:
                         try:
@@ -82,213 +73,208 @@ class LawnmowerPattern:
 
             if len(coords) < 3:
                 raise ValueError(f"Need at least 3 points, found {len(coords)}")
-
-            # Remove duplicate closing point
             if len(coords) > 1 and coords[0] == coords[-1]:
                 coords.pop()
-
-            logger.info(f"KML parsed: {len(coords)} vertices")
             return coords
-            
         except Exception as e:
             logger.error(f"KML parsing error: {e}")
             raise
 
-    @staticmethod
-    def calculate_polygon_size(polygon):
-        """Calculate polygon dimensions in meters"""
-        lats = [p[0] for p in polygon]
-        lons = [p[1] for p in polygon]
-        avg_lat = sum(lats) / len(lats)
-        
-        lat_span = (max(lats) - min(lats)) * 111000
-        lon_span = (max(lons) - min(lons)) * 111000 * math.cos(math.radians(avg_lat))
-        
-        return {
-            'lat_span': lat_span,
-            'lon_span': lon_span,
-            'min_dimension': min(lat_span, lon_span),
-            'max_dimension': max(lat_span, lon_span)
-        }
+    # --- GEOMETRY HELPERS ---
 
     @staticmethod
-    def shrink_polygon(polygon, buffer_meters=0.0):
-        """Shrink polygon inward by buffer"""
-        if len(polygon) < 3 or buffer_meters <= 0:
-            return polygon
-        
-        R = 6371000.0
-        
-        # Calculate centroid
-        lats = [p[0] for p in polygon]
-        lons = [p[1] for p in polygon]
-        centroid_lat = sum(lats) / len(lats)
-        centroid_lon = sum(lons) / len(lons)
-        
-        # Convert buffer to degrees
-        buffer_deg_lat = buffer_meters / R * (180 / math.pi)
-        buffer_deg_lon = buffer_meters / (R * math.cos(math.radians(centroid_lat))) * (180 / math.pi)
-        
-        # Shrink vertices
-        shrunk = []
-        for lat, lon in polygon:
-            vec_lat = lat - centroid_lat
-            vec_lon = lon - centroid_lon
-            dist = math.sqrt(vec_lat**2 + vec_lon**2)
-            
-            if dist > 0:
-                shrink_amount = math.sqrt(buffer_deg_lat**2 + buffer_deg_lon**2)
-                shrink_factor = max(0.05, (dist - shrink_amount) / dist)
-                new_lat = centroid_lat + vec_lat * shrink_factor
-                new_lon = centroid_lon + vec_lon * shrink_factor
-                shrunk.append((new_lat, new_lon))
-            else:
-                shrunk.append((lat, lon))
-        
-        logger.info(f"Buffer applied: {buffer_meters}m")
-        return shrunk
+    def latlon_to_meters(lat, lon, origin_lat, origin_lon):
+        R = 6378137.0
+        x = (math.radians(lon) - math.radians(origin_lon)) * math.cos(math.radians(origin_lat)) * R
+        y = (math.radians(lat) - math.radians(origin_lat)) * R
+        return x, y
 
     @staticmethod
-    def point_in_polygon(point, polygon):
-        """Ray casting algorithm"""
-        x, y = point
-        n = len(polygon)
+    def meters_to_latlon(x, y, origin_lat, origin_lon):
+        R = 6378137.0
+        d_lat = y / R
+        d_lon = x / (R * math.cos(math.radians(origin_lat)))
+        return origin_lat + math.degrees(d_lat), origin_lon + math.degrees(d_lon)
+
+    @staticmethod
+    def rotate_point(x, y, angle_degrees):
+        rad = math.radians(angle_degrees)
+        cos_a = math.cos(rad)
+        sin_a = math.sin(rad)
+        return x * cos_a - y * sin_a, x * sin_a + y * cos_a
+
+    @staticmethod
+    def point_in_polygon_meters(x, y, poly_meters):
         inside = False
-        p1_lat, p1_lon = polygon[0]
-        
-        for i in range(1, n + 1):
-            p2_lat, p2_lon = polygon[i % n]
-            if y > min(p1_lon, p2_lon):
-                if y <= max(p1_lon, p2_lon):
-                    if x <= max(p1_lat, p2_lat):
-                        if p1_lon != p2_lon:
-                            xinters = (y - p1_lon) * (p2_lat - p1_lat) / (p2_lon - p1_lon) + p1_lat
-                        if p1_lat == p2_lat or x <= xinters:
-                            inside = not inside
-            p1_lat, p1_lon = p2_lat, p2_lon
+        n = len(poly_meters)
+        p1x, p1y = poly_meters[0]
+        for i in range(n + 1):
+            p2x, p2y = poly_meters[i % n]
+            if y > min(p1y, p2y):
+                if y <= max(p1y, p2y):
+                    if x <= max(p1x, p2x):
+                        if p1y != p2y:
+                            xinters = (y - p1y) * (p2x - p1x) / (p2y - p1y) + p1x
+                            if p1x == p2x or x <= xinters:
+                                inside = not inside
+            p1x, p1y = p2x, p2y
         return inside
 
     @staticmethod
-    def get_line_polygon_intersections(lat, polygon):
-        """Get intersection points"""
-        intersections = []
-        n = len(polygon)
-        
+    def shrink_polygon_meters(poly_meters, buffer_m):
+        if buffer_m <= 0: return poly_meters
+        cx = sum(p[0] for p in poly_meters) / len(poly_meters)
+        cy = sum(p[1] for p in poly_meters) / len(poly_meters)
+        shrunk = []
+        for x, y in poly_meters:
+            dx = x - cx
+            dy = y - cy
+            dist = math.sqrt(dx*dx + dy*dy)
+            if dist > buffer_m:
+                factor = (dist - buffer_m) / dist
+                shrunk.append((cx + dx*factor, cy + dy*factor))
+            else:
+                shrunk.append((cx, cy))
+        return shrunk
+
+    @staticmethod
+    def get_longest_edge_angle(poly_meters):
+        """Find the angle of the longest edge to align grid efficiently"""
+        max_dist = 0
+        best_angle = 0
+        n = len(poly_meters)
         for i in range(n):
-            p1 = polygon[i]
-            p2 = polygon[(i + 1) % n]
-            lat1, lon1 = p1
-            lat2, lon2 = p2
-            
-            if abs(lat1 - lat2) < 1e-10:
-                continue
-            
-            if min(lat1, lat2) <= lat <= max(lat1, lat2):
-                t = (lat - lat1) / (lat2 - lat1)
-                lon = lon1 + t * (lon2 - lon1)
-                intersections.append(lon)
-        
+            p1 = poly_meters[i]
+            p2 = poly_meters[(i + 1) % n]
+            dx = p2[0] - p1[0]
+            dy = p2[1] - p1[1]
+            dist = math.hypot(dx, dy)
+            if dist > max_dist:
+                max_dist = dist
+                best_angle = math.degrees(math.atan2(dy, dx))
+        return best_angle
+
+    @staticmethod
+    def get_intersections(y_line, poly_meters):
+        intersections = []
+        n = len(poly_meters)
+        for i in range(n):
+            p1 = poly_meters[i]
+            p2 = poly_meters[(i + 1) % n]
+            if min(p1[1], p2[1]) < y_line <= max(p1[1], p2[1]):
+                if abs(p2[1] - p1[1]) > 1e-9:
+                    x = p1[0] + (y_line - p1[1]) * (p2[0] - p1[0]) / (p2[1] - p1[1])
+                    intersections.append(x)
         return sorted(intersections)
 
     @staticmethod
     def lawnmower_from_polygon(polygon, spacing_m, altitude, geofence_buffer_m=0.0):
-        """Generate lawnmower pattern"""
-        if len(polygon) < 3:
-            raise ValueError("Polygon must have at least 3 vertices")
+        if len(polygon) < 3: raise ValueError("Polygon < 3 vertices")
+            
+        logger.info(f"GENERATING: Alt={altitude}m, Space={spacing_m}m")
+
+        # 1. Project to Meters
+        avg_lat = sum(p[0] for p in polygon) / len(polygon)
+        avg_lon = sum(p[1] for p in polygon) / len(polygon)
+        poly_meters = [LawnmowerPattern.latlon_to_meters(lat, lon, avg_lat, avg_lon) for lat, lon in polygon]
+
+        # 2. AUTO-ROTATION (Align with longest edge)
+        # This makes lines parallel to the longest boundary = Fewer turns = Max Efficiency
+        rotation_angle = -LawnmowerPattern.get_longest_edge_angle(poly_meters)
+        logger.info(f"Optimal rotation: {rotation_angle:.1f} deg")
         
-        logger.info("="*60)
-        logger.info("LAWNMOWER PATTERN GENERATION")
+        rotated_poly = [LawnmowerPattern.rotate_point(x, y, rotation_angle) for x, y in poly_meters]
+        work_poly = LawnmowerPattern.shrink_polygon_meters(rotated_poly, geofence_buffer_m)
+
+        if not work_poly: raise ValueError("Buffer too large")
+
+        # 3. CALCULATE CENTROID & SPAN
+        min_y = min(p[1] for p in work_poly)
+        max_y = max(p[1] for p in work_poly)
+        center_y = (min_y + max_y) / 2
+        total_height = max_y - min_y
+
+        if total_height < 0.1: raise ValueError("Area too small")
+
+        # 4. CENTROID ALIGNMENT (The "Middle of Lanes" Fix)
+        # Determine how many lines fit
+        num_lines = max(1, math.ceil(total_height / spacing_m))
         
-        size_info = LawnmowerPattern.calculate_polygon_size(polygon)
-        logger.info(f"Polygon: {size_info['lat_span']:.1f}m x {size_info['lon_span']:.1f}m")
+        # Calculate total grid height
+        grid_height = (num_lines - 1) * spacing_m
         
-        if size_info['min_dimension'] < 3:
-            raise ValueError(
-                f"Polygon too small: {size_info['lat_span']:.1f}m x {size_info['lon_span']:.1f}m\n"
-                f"Need at least 3m in both dimensions"
-            )
+        # Start Y so the grid is perfectly centered
+        start_y = center_y - (grid_height / 2)
         
-        # Apply buffer
-        work_polygon = LawnmowerPattern.shrink_polygon(polygon, geofence_buffer_m)
-        
-        R = 6371000.0
-        lats = [p[0] for p in work_polygon]
-        lons = [p[1] for p in work_polygon]
-        min_lat, max_lat = min(lats), max(lats)
-        
-        spacing_lat = spacing_m / R * (180 / math.pi)
-        logger.info(f"Line spacing: {spacing_m}m")
-        
-        waypoints = []
+        logger.info(f"Centering: PolyH={total_height:.1f}m, Lines={num_lines}, StartOffset={start_y - min_y:.1f}m")
+
+        # 5. Generate Waypoints
+        waypoints_rotated = []
+        current_y = start_y
         flip = False
-        current_lat = min_lat
-        
-        while current_lat <= max_lat:
-            intersections = LawnmowerPattern.get_line_polygon_intersections(current_lat, work_polygon)
+
+        for _ in range(num_lines):
+            intersections = LawnmowerPattern.get_intersections(current_y, work_poly)
             
+            # Clean up intersections (group by proximity to avoid tiny zig-zags on vertices)
             if len(intersections) >= 2:
-                for j in range(0, len(intersections) - 1, 2):
-                    lon_start = intersections[j]
-                    lon_end = intersections[j + 1]
-                    midpoint_lon = (lon_start + lon_end) / 2
+                # Basic logic: take min and max x for this line (simple sweep)
+                # Or handle complex polygons (holes):
+                for i in range(0, len(intersections) - 1, 2):
+                    x1, x2 = intersections[i], intersections[i+1]
                     
-                    if LawnmowerPattern.point_in_polygon((current_lat, midpoint_lon), work_polygon):
+                    # Ensure we are actually inside (handle concave)
+                    mid = (x1 + x2)/2
+                    if LawnmowerPattern.point_in_polygon_meters(mid, current_y, work_poly):
                         if flip:
-                            waypoints.extend([
-                                (current_lat, lon_end, altitude),
-                                (current_lat, lon_start, altitude)
-                            ])
+                            waypoints_rotated.extend([(x2, current_y), (x1, current_y)])
                         else:
-                            waypoints.extend([
-                                (current_lat, lon_start, altitude),
-                                (current_lat, lon_end, altitude)
-                            ])
+                            waypoints_rotated.extend([(x1, current_y), (x2, current_y)])
             
+            current_y += spacing_m
             flip = not flip
-            current_lat += spacing_lat
+
+        # 6. Un-rotate and Reproject
+        final_waypoints = []
+        for wx, wy in waypoints_rotated:
+            ox, oy = LawnmowerPattern.rotate_point(wx, wy, -rotation_angle)
+            lat, lon = LawnmowerPattern.meters_to_latlon(ox, oy, avg_lat, avg_lon)
+            final_waypoints.append((lat, lon, altitude))
+
+        return final_waypoints
+
+    # --- THIS WAS MISSING AND CAUSED THE ERROR ---
+    @staticmethod
+    def calculate_polygon_size(polygon):
+        """Estimate size for UI display"""
+        if not polygon: return {'lat_span': 0, 'lon_span': 0}
         
-        logger.info(f"Generated {len(waypoints)} waypoints")
-        logger.info("="*60)
+        lats = [p[0] for p in polygon]
+        lons = [p[1] for p in polygon]
+        avg_lat = sum(lats) / len(lats)
         
-        if len(waypoints) == 0:
-            raise ValueError(
-                "No waypoints generated!\n\n"
-                "Try:\n"
-                "- Set buffer to 0m\n"
-                "- Lower altitude\n"
-                "- Larger survey area"
-            )
+        # Approximate conversion (1 deg lat ~ 111.32km)
+        lat_span = (max(lats) - min(lats)) * 111320
+        lon_span = (max(lons) - min(lons)) * 111320 * math.cos(math.radians(avg_lat))
         
-        return waypoints
+        return {
+            'lat_span': lat_span,
+            'lon_span': lon_span,
+        }
 
     @staticmethod
     def calculate_pattern_stats(waypoints):
-        """Calculate pattern statistics"""
-        if len(waypoints) < 2:
-            return {"total_distance": 0, "num_waypoints": len(waypoints)}
-        
-        total_distance = 0
-        R = 6371000.0
-        
-        for i in range(len(waypoints) - 1):
+        if len(waypoints) < 2: return {"total_distance": 0, "num_waypoints": len(waypoints)}
+        total_dist = 0
+        R = 6378137.0
+        for i in range(len(waypoints)-1):
             lat1, lon1, _ = waypoints[i]
-            lat2, lon2, _ = waypoints[i + 1]
-            
-            phi1 = math.radians(lat1)
-            phi2 = math.radians(lat2)
-            dphi = math.radians(lat2 - lat1)
-            dlambda = math.radians(lon2 - lon1)
-            
-            a = math.sin(dphi/2)**2 + math.cos(phi1) * math.cos(phi2) * math.sin(dlambda/2)**2
-            distance = 2 * R * math.atan2(math.sqrt(a), math.sqrt(1 - a))
-            total_distance += distance
-        
-        return {
-            "total_distance": total_distance,
-            "num_waypoints": len(waypoints)
-        }
-
-
+            lat2, lon2, _ = waypoints[i+1]
+            a = math.sin(math.radians(lat2-lat1)/2)**2 + math.cos(math.radians(lat1))*math.cos(math.radians(lat2))*math.sin(math.radians(lon2-lon1)/2)**2
+            total_dist += R * 2 * math.atan2(math.sqrt(a), math.sqrt(1-a))
+        return {"total_distance": total_dist, "num_waypoints": len(waypoints)}
+    
+    
 # =====================================================
 # SURVEY WINDOW
 # =====================================================
