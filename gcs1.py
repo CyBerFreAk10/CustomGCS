@@ -7,6 +7,7 @@ import logging
 from lawnmower_survey import SurveyWindow
 import math
 import queue
+import re
 
 # Try to import tkintermapview
 try:
@@ -28,6 +29,50 @@ logging.basicConfig(
 logger = logging.getLogger("GCS")
 
 # -------------------------------
+# COM Port Auto-Detection
+# -------------------------------
+def find_available_ports():
+    """Find all available serial ports"""
+    import serial.tools.list_ports
+    ports = list(serial.tools.list_ports.comports())
+    available = [port.device for port in ports]
+    logger.info(f"Available ports: {available}")
+    return available
+
+def find_drone_port(baud=57600, timeout=3):
+    """
+    Scan all available ports and find one with MAVLink heartbeat
+    Returns: (port_name, mavlink_connection) or (None, None)
+    """
+    import serial.tools.list_ports
+    
+    ports = list(serial.tools.list_ports.comports())
+    logger.info(f"Scanning {len(ports)} ports for MAVLink heartbeat...")
+    
+    for port in ports:
+        port_name = port.device
+        try:
+            logger.info(f"  Trying {port_name}...")
+            
+            # Try to connect
+            master = mavutil.mavlink_connection(port_name, baud=baud)
+            
+            # Wait for heartbeat with timeout
+            logger.info(f"    Waiting for heartbeat on {port_name}...")
+            msg = master.wait_heartbeat(timeout=timeout)
+            
+            if msg:
+                logger.info(f"    ✓ Heartbeat found on {port_name}!")
+                return port_name, master
+            
+        except Exception as e:
+            logger.debug(f"    ✗ {port_name}: {e}")
+            continue
+    
+    logger.warning("No MAVLink heartbeat found on any port")
+    return None, None
+
+# -------------------------------
 # Payload Queue Manager
 # -------------------------------
 class PayloadQueue:
@@ -43,24 +88,36 @@ class PayloadQueue:
                 'lon': lon,
                 'delivered': False
             }
+            logger.info(f"Payload target added/updated: {person_id} at ({lat:.6f}, {lon:.6f})")
     
     def mark_delivered(self, person_id):
         """Mark a target as delivered"""
         with self.lock:
             if person_id in self.targets:
                 self.targets[person_id]['delivered'] = True
+                logger.info(f"Payload delivered to: {person_id}")
+                return True
+        return False
     
     def get_all_targets(self):
-        """Get all targets as a list"""
+        """Get all targets as a list - thread safe copy"""
         with self.lock:
             return [(pid, t['lat'], t['lon'], t['delivered']) 
-                    for pid, t in self.targets.items()]
+                    for pid, t in sorted(self.targets.items())]
+    
+    def get_next_undelivered(self):
+        """Get the next undelivered target (first in queue)"""
+        with self.lock:
+            for pid, t in sorted(self.targets.items()):
+                if not t['delivered']:
+                    return (pid, t['lat'], t['lon'])
+        return None
     
     def get_undelivered_targets(self):
         """Get only undelivered targets"""
         with self.lock:
             return [(pid, t['lat'], t['lon']) 
-                    for pid, t in self.targets.items() 
+                    for pid, t in sorted(self.targets.items()) 
                     if not t['delivered']]
     
     def remove_target(self, person_id):
@@ -68,6 +125,15 @@ class PayloadQueue:
         with self.lock:
             if person_id in self.targets:
                 del self.targets[person_id]
+                logger.info(f"Payload target removed: {person_id}")
+                return True
+        return False
+    
+    def clear_all(self):
+        """Clear all targets"""
+        with self.lock:
+            self.targets.clear()
+            logger.info("All payload targets cleared")
 
 # -------------------------------
 # MAVLink Helper Class (Enhanced)
@@ -100,6 +166,9 @@ class Drone:
         }
         self.telemetry_lock = threading.Lock()
         
+        # Person detection callback
+        self.person_detection_callback = None
+        
         logger.info(f"{self.name} object created (Port={port}, Baud={baud})")
 
     def get_telemetry(self):
@@ -111,6 +180,10 @@ class Drone:
         """Thread-safe telemetry update"""
         with self.telemetry_lock:
             self.telemetry[key] = value
+
+    def set_person_detection_callback(self, callback):
+        """Set callback for person detection events"""
+        self.person_detection_callback = callback
 
     def distance_to(self, target_lat, target_lon):
         """
@@ -363,6 +436,25 @@ class Drone:
                     self.update_telemetry('armed', bool(armed))
                     self.update_telemetry('mode', mode)
                 
+                # STATUSTEXT - PERSON DETECTION PARSING
+                elif msg_type == "STATUSTEXT":
+                    text = msg.text.decode(errors="ignore").strip()
+                    logger.info(f"[{self.name}] STATUS → {text}")
+                    
+                    # Parse person detection: "person<id>,lat,lon"
+                    # Example: "person1,37.123456,-122.654321"
+                    match = re.match(r'person(\d+),([-\d.]+),([-\d.]+)', text, re.IGNORECASE)
+                    if match:
+                        person_id = match.group(1)
+                        lat = float(match.group(2))
+                        lon = float(match.group(3))
+                        
+                        logger.info(f"[{self.name}] 🎯 Person detected: ID={person_id}, Lat={lat:.6f}, Lon={lon:.6f}")
+                        
+                        # Call detection callback
+                        if self.person_detection_callback:
+                            self.person_detection_callback(person_id, lat, lon)
+                
                 # COMMAND ACK
                 elif msg_type == "COMMAND_ACK":
                     result_map = {
@@ -373,11 +465,6 @@ class Drone:
                         mavutil.mavlink.MAV_RESULT_FAILED: "FAILED"
                     }
                     logger.info(f"[{self.name}] COMMAND_ACK → Command={msg.command}, Result={result_map.get(msg.result, 'UNKNOWN')}")
-                
-                # STATUS TEXT
-                elif msg_type == "STATUSTEXT":
-                    text = msg.text.decode(errors="ignore")
-                    logger.warning(f"[{self.name}] STATUS → {text}")
         
         threading.Thread(
             target=listener,
@@ -481,18 +568,20 @@ class MapWidget(ttk.Frame):
         
         self.drone1_marker = None
         self.drone2_marker = None
-        self.target_markers = {}  # {person_id: marker}
+        self.target_markers = {}
+        self.map_centered = False
+        
+        # Survey visualization
+        self.geofence_path = None
+        self.pattern_path = None
+        self.pattern_markers = []
         
         if MAP_AVAILABLE:
-            # Create map
             self.map_widget = TkinterMapView(self, corner_radius=0)
             self.map_widget.pack(fill=tk.BOTH, expand=True)
-            
-            # Set default position (you can change this)
-            self.map_widget.set_position(37.7749, -122.4194)  # San Francisco
+            self.map_widget.set_position(37.7749, -122.4194)
             self.map_widget.set_zoom(15)
             
-            # Start update loop
             self.update_map()
         else:
             ttk.Label(
@@ -501,6 +590,123 @@ class MapWidget(ttk.Frame):
                 font=("Arial", 12)
             ).pack(expand=True)
     
+    def visualize_geofence(self, polygon):
+        """Visualize geofence boundary on map"""
+        if not MAP_AVAILABLE or not polygon:
+            return
+        
+        try:
+            # Clear old geofence
+            if self.geofence_path:
+                try:
+                    self.geofence_path.delete()
+                except:
+                    pass
+            
+            coords = [(lat, lon) for lat, lon in polygon]
+            coords.append(polygon[0])  # Close polygon
+            
+            self.geofence_path = self.map_widget.set_path(
+                coords,
+                color="red",
+                width=3
+            )
+            
+            # Center on geofence
+            lats = [p[0] for p in polygon]
+            lons = [p[1] for p in polygon]
+            center_lat = (min(lats) + max(lats)) / 2
+            center_lon = (min(lons) + max(lons)) / 2
+            self.map_widget.set_position(center_lat, center_lon)
+            self.map_widget.set_zoom(16)
+            
+            logger.info("Geofence visualized on main GCS map (RED)")
+            
+        except Exception as e:
+            logger.error(f"Geofence viz error: {e}")
+    
+    def visualize_pattern(self, waypoints):
+        """Visualize survey pattern on map"""
+        if not MAP_AVAILABLE or not waypoints:
+            return
+        
+        try:
+            # Clear old pattern
+            if self.pattern_path:
+                try:
+                    self.pattern_path.delete()
+                except:
+                    pass
+            
+            for marker in self.pattern_markers:
+                if marker:
+                    try:
+                        marker.delete()
+                    except:
+                        pass
+            self.pattern_markers.clear()
+            
+            # Draw pattern path
+            coords = [(lat, lon) for lat, lon, _ in waypoints]
+            self.pattern_path = self.map_widget.set_path(
+                coords,
+                color="blue",
+                width=2
+            )
+            
+            # Add start/end markers
+            if len(waypoints) > 0:
+                lat, lon, _ = waypoints[0]
+                start_marker = self.map_widget.set_marker(
+                    lat, lon,
+                    text="START",
+                    marker_color_circle="green",
+                    marker_color_outside="darkgreen"
+                )
+                self.pattern_markers.append(start_marker)
+            
+            if len(waypoints) > 1:
+                lat, lon, _ = waypoints[-1]
+                end_marker = self.map_widget.set_marker(
+                    lat, lon,
+                    text="END",
+                    marker_color_circle="orange",
+                    marker_color_outside="darkorange"
+                )
+                self.pattern_markers.append(end_marker)
+            
+            logger.info("Survey pattern visualized on main GCS map (BLUE)")
+            
+        except Exception as e:
+            logger.error(f"Pattern viz error: {e}")
+    
+    def clear_survey_viz(self):
+        """Clear survey visualization"""
+        if not MAP_AVAILABLE:
+            return
+        
+        try:
+            if self.geofence_path:
+                self.geofence_path.delete()
+                self.geofence_path = None
+            
+            if self.pattern_path:
+                self.pattern_path.delete()
+                self.pattern_path = None
+            
+            for marker in self.pattern_markers:
+                if marker:
+                    try:
+                        marker.delete()
+                    except:
+                        pass
+            self.pattern_markers.clear()
+            
+            logger.info("Survey visualization cleared from main GCS map")
+            
+        except Exception as e:
+            logger.error(f"Clear survey viz error: {e}")
+    
     def update_map(self):
         """Update drone and target positions on map"""
         try:
@@ -508,27 +714,49 @@ class MapWidget(ttk.Frame):
             telem1 = self.drone1.get_telemetry()
             if telem1['lat'] != 0 and telem1['lon'] != 0:
                 if self.drone1_marker:
-                    self.drone1_marker.delete()
+                    try:
+                        self.drone1_marker.delete()
+                    except:
+                        pass
+                
                 self.drone1_marker = self.map_widget.set_marker(
                     telem1['lat'], 
                     telem1['lon'],
-                    text="Drone 1 (Scout)",
+                    text=f"Scout\n{telem1['relative_alt']:.1f}m",
                     marker_color_circle="blue",
                     marker_color_outside="darkblue"
                 )
+                
+                # Auto-center on first GPS lock
+                if not self.map_centered:
+                    self.map_widget.set_position(telem1['lat'], telem1['lon'])
+                    self.map_widget.set_zoom(17)
+                    self.map_centered = True
+                    logger.info(f"Map centered on Drone 1: {telem1['lat']:.6f}, {telem1['lon']:.6f}")
             
             # Update Drone 2
             telem2 = self.drone2.get_telemetry()
             if telem2['lat'] != 0 and telem2['lon'] != 0:
                 if self.drone2_marker:
-                    self.drone2_marker.delete()
+                    try:
+                        self.drone2_marker.delete()
+                    except:
+                        pass
+                
                 self.drone2_marker = self.map_widget.set_marker(
                     telem2['lat'], 
                     telem2['lon'],
-                    text="Drone 2 (Delivery)",
+                    text=f"Delivery\n{telem2['relative_alt']:.1f}m",
                     marker_color_circle="red",
                     marker_color_outside="darkred"
                 )
+                
+                # Auto-center if drone1 hasn't gotten lock yet
+                if not self.map_centered:
+                    self.map_widget.set_position(telem2['lat'], telem2['lon'])
+                    self.map_widget.set_zoom(17)
+                    self.map_centered = True
+                    logger.info(f"Map centered on Drone 2: {telem2['lat']:.6f}, {telem2['lon']:.6f}")
             
             # Update target markers
             targets = self.payload_queue.get_all_targets()
@@ -537,21 +765,30 @@ class MapWidget(ttk.Frame):
             # Remove deleted targets
             for pid in list(self.target_markers.keys()):
                 if pid not in current_target_ids:
-                    self.target_markers[pid].delete()
+                    if self.target_markers[pid]:
+                        try:
+                            self.target_markers[pid].delete()
+                        except:
+                            pass
                     del self.target_markers[pid]
             
             # Add/update targets
             for person_id, lat, lon, delivered in targets:
-                if person_id in self.target_markers:
-                    self.target_markers[person_id].delete()
+                # Delete old marker
+                if person_id in self.target_markers and self.target_markers[person_id]:
+                    try:
+                        self.target_markers[person_id].delete()
+                    except:
+                        pass
                 
                 color = "green" if delivered else "orange"
                 outside_color = "darkgreen" if delivered else "darkorange"
                 status = "✓ Delivered" if delivered else "Pending"
                 
+                # Create new marker
                 self.target_markers[person_id] = self.map_widget.set_marker(
                     lat, lon,
-                    text=f"Person {person_id} - {status}",
+                    text=f"Person {person_id}\n{status}",
                     marker_color_circle=color,
                     marker_color_outside=outside_color
                 )
@@ -561,7 +798,7 @@ class MapWidget(ttk.Frame):
                 if not delivered:
                     dist = self.drone2.distance_to(lat, lon)
                     if dist is not None and dist < 5.0:
-                        logger.info(f"Payload delivered to Person {person_id}!")
+                        logger.info(f"🎯 Payload delivered to Person {person_id}!")
                         self.payload_queue.mark_delivered(person_id)
             
         except Exception as e:
@@ -597,22 +834,34 @@ class PayloadQueueWidget(ttk.Frame):
         
         # Control frame
         control_frame = ttk.Frame(self)
-        control_frame.pack(pady=5)
+        control_frame.pack(pady=5, fill=tk.X)
         
-        ttk.Label(control_frame, text="Person ID:").grid(row=0, column=0, padx=5)
+        # Input fields
+# CONTINUATION OF gcs.py - Part 2
+
+# Payload Queue Table Widget (continued)
+        input_frame = ttk.Frame(control_frame)
+        input_frame.pack(fill=tk.X, padx=5)
+        
+        ttk.Label(input_frame, text="Person ID:").grid(row=0, column=0, padx=5, sticky=tk.W)
         self.person_id_var = tk.StringVar()
-        ttk.Entry(control_frame, textvariable=self.person_id_var, width=10).grid(row=0, column=1, padx=5)
+        ttk.Entry(input_frame, textvariable=self.person_id_var, width=12).grid(row=0, column=1, padx=5)
         
-        ttk.Label(control_frame, text="Lat:").grid(row=0, column=2, padx=5)
-        self.lat_var = tk.DoubleVar()
-        ttk.Entry(control_frame, textvariable=self.lat_var, width=12).grid(row=0, column=3, padx=5)
+        ttk.Label(input_frame, text="Lat:").grid(row=0, column=2, padx=5, sticky=tk.W)
+        self.lat_var = tk.DoubleVar(value=0.0)
+        ttk.Entry(input_frame, textvariable=self.lat_var, width=12).grid(row=0, column=3, padx=5)
         
-        ttk.Label(control_frame, text="Lon:").grid(row=0, column=4, padx=5)
-        self.lon_var = tk.DoubleVar()
-        ttk.Entry(control_frame, textvariable=self.lon_var, width=12).grid(row=0, column=5, padx=5)
+        ttk.Label(input_frame, text="Lon:").grid(row=0, column=4, padx=5, sticky=tk.W)
+        self.lon_var = tk.DoubleVar(value=0.0)
+        ttk.Entry(input_frame, textvariable=self.lon_var, width=12).grid(row=0, column=5, padx=5)
         
-        ttk.Button(control_frame, text="Add/Update", command=self.add_target).grid(row=0, column=6, padx=5)
-        ttk.Button(control_frame, text="Remove", command=self.remove_target).grid(row=0, column=7, padx=5)
+        # Buttons
+        button_frame = ttk.Frame(control_frame)
+        button_frame.pack(fill=tk.X, padx=5, pady=5)
+        
+        ttk.Button(button_frame, text="Add/Update", command=self.add_target).pack(side=tk.LEFT, padx=5)
+        ttk.Button(button_frame, text="Remove", command=self.remove_target).pack(side=tk.LEFT, padx=5)
+        ttk.Button(button_frame, text="Clear All", command=self.clear_all).pack(side=tk.LEFT, padx=5)
         
         # Start update loop
         self.update_table()
@@ -620,23 +869,29 @@ class PayloadQueueWidget(ttk.Frame):
     def add_target(self):
         """Add or update a target"""
         try:
-            person_id = self.person_id_var.get()
-            lat = self.lat_var.get()
-            lon = self.lon_var.get()
+            person_id = self.person_id_var.get().strip()
             
             if not person_id:
                 messagebox.showerror("Error", "Please enter a Person ID")
                 return
             
+            lat = self.lat_var.get()
+            lon = self.lon_var.get()
+            
+            if lat == 0.0 and lon == 0.0:
+                messagebox.showwarning("Warning", "Coordinates are (0, 0). Is this correct?")
+            
             self.payload_queue.add_target(person_id, lat, lon)
-            logger.info(f"Target added/updated: Person {person_id} at ({lat}, {lon})")
             
             # Clear entries
             self.person_id_var.set("")
             self.lat_var.set(0.0)
             self.lon_var.set(0.0)
             
+            messagebox.showinfo("Success", f"Target {person_id} added/updated")
+            
         except Exception as e:
+            logger.error(f"Add target error: {e}")
             messagebox.showerror("Error", f"Failed to add target: {e}")
     
     def remove_target(self):
@@ -646,10 +901,23 @@ class PayloadQueueWidget(ttk.Frame):
             messagebox.showwarning("Warning", "Please select a target to remove")
             return
         
-        for item in selection:
-            person_id = self.tree.item(item)['values'][0]
-            self.payload_queue.remove_target(person_id)
-            logger.info(f"Target removed: Person {person_id}")
+        try:
+            for item in selection:
+                values = self.tree.item(item)['values']
+                person_id = str(values[0])
+                self.payload_queue.remove_target(person_id)
+            
+            messagebox.showinfo("Success", "Target(s) removed")
+            
+        except Exception as e:
+            logger.error(f"Remove target error: {e}")
+            messagebox.showerror("Error", f"Failed to remove target: {e}")
+    
+    def clear_all(self):
+        """Clear all targets"""
+        if messagebox.askyesno("Confirm", "Remove all targets?"):
+            self.payload_queue.clear_all()
+            messagebox.showinfo("Success", "All targets cleared")
     
     def update_table(self):
         """Update the table display"""
@@ -662,11 +930,10 @@ class PayloadQueueWidget(ttk.Frame):
             targets = self.payload_queue.get_all_targets()
             for person_id, lat, lon, delivered in targets:
                 status = "✓ Delivered" if delivered else "Pending"
-                self.tree.insert("", tk.END, values=(person_id, f"{lat:.6f}", f"{lon:.6f}", status))
+                item_id = self.tree.insert("", tk.END, values=(person_id, f"{lat:.6f}", f"{lon:.6f}", status))
                 
                 # Color coding
                 if delivered:
-                    item_id = self.tree.get_children()[-1]
                     self.tree.item(item_id, tags=('delivered',))
             
             self.tree.tag_configure('delivered', background='lightgreen')
@@ -688,17 +955,63 @@ class GCSApp(tk.Tk):
         self.title("Dual Drone GCS - Mission Control Dashboard")
         self.geometry("1400x900")
         
-        # Create drones
-        self.drone1 = Drone("COM5", 57600, "Drone1-Scout")
-        self.drone2 = Drone("COM4", 57600, "Drone2-Delivery")
+        # Create drones (ports will be auto-detected)
+        self.drone1 = Drone("AUTO", 57600, "Drone1-Scout")
+        self.drone2 = Drone("AUTO", 57600, "Drone2-Delivery")
         
         # Create payload queue
         self.payload_queue = PayloadQueue()
+        
+        # Max altitude setting (default 6m)
+        self.max_altitude = tk.DoubleVar(value=6.0)
+        
+        # Mission state
+        self.mission_active = False
+        self.mission_thread = None
+        self.survey_waypoints = []
+        self.geofence_polygon = []  # Store geofence for visualization
+        
+        # Set up person detection callback
+        self.drone1.set_person_detection_callback(self.on_person_detected)
         
         # Create main layout
         self.create_widgets()
         
         logger.info("GUI initialized successfully")
+
+    def on_person_detected(self, person_id, lat, lon):
+        """Callback when scout drone detects a person"""
+        logger.info(f"📡 GCS received person detection: ID={person_id}, Lat={lat}, Lon={lon}")
+        
+        # Add to payload queue (will update if person already exists)
+        self.payload_queue.add_target(person_id, lat, lon)
+        
+        # Show notification
+        self.after(0, lambda: messagebox.showinfo(
+            "Person Detected",
+            f"Person {person_id} detected!\nLocation: {lat:.6f}, {lon:.6f}\n\nAdded to delivery queue."
+        ))
+
+    def auto_connect_drone(self, drone):
+        """Auto-detect and connect to a drone"""
+        try:
+            logger.info(f"[{drone.name}] Auto-detecting port...")
+            
+            port, master = find_drone_port(baud=drone.baud, timeout=3)
+            
+            if port and master:
+                drone.port = port
+                drone.master = master
+                logger.info(f"[{drone.name}] Connected to {port}")
+                drone.start_telemetry_listener()
+                messagebox.showinfo("Connected", f"{drone.name} connected to {port}")
+            else:
+                logger.error(f"[{drone.name}] No drone found on any port")
+                messagebox.showerror("Error", f"Could not find {drone.name} on any port.\n\nMake sure:\n- Drone is powered on\n- USB cable is connected\n- Drivers are installed")
+        
+        except Exception as e:
+            logger.error(f"[{drone.name}] Auto-connect failed: {e}")
+            messagebox.showerror("Error", f"Connection failed: {e}")
 
     def create_widgets(self):
         # Main title
@@ -739,31 +1052,80 @@ class GCSApp(tk.Tk):
         control_frame = ttk.LabelFrame(left_panel, text="Mission Controls")
         control_frame.pack(fill=tk.X, padx=5, pady=5)
         
-        # Connection buttons
+        # Connection buttons (AUTO-DETECT)
         conn_frame = ttk.Frame(control_frame)
         conn_frame.pack(fill=tk.X, pady=5)
         ttk.Button(
-            conn_frame, text="Connect Drone 1",
+            conn_frame, text="🔍 Auto-Connect Drone 1",
             command=lambda: threading.Thread(
-                target=self.drone1.connect, daemon=True
+                target=self.auto_connect_drone, args=(self.drone1,), daemon=True
             ).start()
         ).pack(side=tk.LEFT, padx=5)
         ttk.Button(
-            conn_frame, text="Connect Drone 2",
+            conn_frame, text="🔍 Auto-Connect Drone 2",
             command=lambda: threading.Thread(
-                target=self.drone2.connect, daemon=True
+                target=self.auto_connect_drone, args=(self.drone2,), daemon=True
             ).start()
         ).pack(side=tk.LEFT, padx=5)
         
-        # Quick actions
-        ttk.Button(control_frame, text="ARM Both Drones", command=self.arm_both).pack(fill=tk.X, padx=5, pady=2)
-        ttk.Button(control_frame, text="Takeoff Both", command=self.takeoff_both).pack(fill=tk.X, padx=5, pady=2)
-        ttk.Button(control_frame, text="RTL Both", command=self.rtl_both).pack(fill=tk.X, padx=5, pady=2)
+        # Max Altitude Setting
+        alt_frame = ttk.Frame(control_frame)
+        alt_frame.pack(fill=tk.X, pady=5)
+        ttk.Label(alt_frame, text="Max Altitude (m):").pack(side=tk.LEFT, padx=5)
+        ttk.Entry(alt_frame, textvariable=self.max_altitude, width=8).pack(side=tk.LEFT)
+        ttk.Label(alt_frame, text="(Default: 6m)", font=("Arial", 8), foreground="gray").pack(side=tk.LEFT, padx=5)
+        
+        # === INDIVIDUAL DRONE CONTROLS (PRE-FLIGHT CHECKS) ===
+        preflight_frame = ttk.LabelFrame(control_frame, text="Pre-Flight Controls")
+        preflight_frame.pack(fill=tk.X, padx=5, pady=5)
+        
+        # Drone 1 controls
+        d1_frame = ttk.Frame(preflight_frame)
+        d1_frame.pack(fill=tk.X, pady=2)
+        ttk.Label(d1_frame, text="Drone 1 (Scout):", font=("Arial", 9, "bold")).pack(side=tk.LEFT, padx=5)
+        ttk.Button(d1_frame, text="ARM", command=lambda: self.arm_single(self.drone1), width=10).pack(side=tk.LEFT, padx=2)
+        ttk.Button(d1_frame, text="TAKEOFF", command=lambda: self.takeoff_single(self.drone1), width=10).pack(side=tk.LEFT, padx=2)
+        ttk.Button(d1_frame, text="RTL", command=lambda: self.drone1.rtl(), width=10).pack(side=tk.LEFT, padx=2)
+        
+        # Drone 2 controls
+        d2_frame = ttk.Frame(preflight_frame)
+        d2_frame.pack(fill=tk.X, pady=2)
+        ttk.Label(d2_frame, text="Drone 2 (Delivery):", font=("Arial", 9, "bold")).pack(side=tk.LEFT, padx=5)
+        ttk.Button(d2_frame, text="ARM", command=lambda: self.arm_single(self.drone2), width=10).pack(side=tk.LEFT, padx=2)
+        ttk.Button(d2_frame, text="TAKEOFF", command=lambda: self.takeoff_single(self.drone2), width=10).pack(side=tk.LEFT, padx=2)
+        ttk.Button(d2_frame, text="RTL", command=lambda: self.drone2.rtl(), width=10).pack(side=tk.LEFT, padx=2)
+        
+        # === MAIN MISSION CONTROLS ===
+        mission_frame = ttk.LabelFrame(control_frame, text="Main Mission")
+        mission_frame.pack(fill=tk.X, padx=5, pady=5)
+        
         ttk.Button(
-            control_frame, 
+            mission_frame, 
             text="Open Survey Tool", 
             command=self.open_survey_window
         ).pack(fill=tk.X, padx=5, pady=2)
+        
+        ttk.Button(
+            mission_frame, 
+            text="🚀 START MISSION", 
+            command=self.start_mission,
+            style="Accent.TButton"
+        ).pack(fill=tk.X, padx=5, pady=2)
+        
+        ttk.Button(
+            mission_frame, 
+            text="🛑 EMERGENCY STOP", 
+            command=self.emergency_stop
+        ).pack(fill=tk.X, padx=5, pady=2)
+        
+        # Mission status
+        self.mission_status_var = tk.StringVar(value="Mission: IDLE")
+        ttk.Label(
+            mission_frame, 
+            textvariable=self.mission_status_var,
+            font=("Arial", 10, "bold"),
+            foreground="gray"
+        ).pack(pady=5)
         
         # === RIGHT PANEL ===
         
@@ -772,9 +1134,35 @@ class GCSApp(tk.Tk):
         map_label_frame.pack(fill=tk.BOTH, expand=True, padx=5, pady=5)
         
         if MAP_AVAILABLE:
-            MapWidget(map_label_frame, self.drone1, self.drone2, self.payload_queue).pack(
-                fill=tk.BOTH, expand=True
-            )
+            # Map controls at top
+            map_control_frame = ttk.Frame(map_label_frame)
+            map_control_frame.pack(fill=tk.X, padx=5, pady=5)
+            
+            self.map_widget_ref = MapWidget(map_label_frame, self.drone1, self.drone2, self.payload_queue)
+            self.map_widget_ref.pack(fill=tk.BOTH, expand=True)
+            
+            # Add control buttons
+            ttk.Button(
+                map_control_frame,
+                text="📍 Center on Drones",
+                command=self.center_map_on_drones
+            ).pack(side=tk.LEFT, padx=5)
+            
+            ttk.Button(
+                map_control_frame,
+                text="🔍 Zoom In",
+                command=lambda: self.map_widget_ref.map_widget.set_zoom(
+                    self.map_widget_ref.map_widget.zoom + 1
+                ) if MAP_AVAILABLE else None
+            ).pack(side=tk.LEFT, padx=5)
+            
+            ttk.Button(
+                map_control_frame,
+                text="🔍 Zoom Out",
+                command=lambda: self.map_widget_ref.map_widget.set_zoom(
+                    self.map_widget_ref.map_widget.zoom - 1
+                ) if MAP_AVAILABLE else None
+            ).pack(side=tk.LEFT, padx=5)
         else:
             ttk.Label(
                 map_label_frame,
@@ -790,10 +1178,10 @@ class GCSApp(tk.Tk):
     # -------------------------------
     # Control Methods
     # -------------------------------
-    def arm_both(self):
-        logger.info("Arming both drones")
-        threading.Thread(target=self._arm_drone, args=(self.drone1,), daemon=True).start()
-        threading.Thread(target=self._arm_drone, args=(self.drone2,), daemon=True).start()
+    def arm_single(self, drone):
+        """ARM a single drone"""
+        logger.info(f"Arming {drone.name}")
+        threading.Thread(target=self._arm_drone, args=(drone,), daemon=True).start()
     
     def _arm_drone(self, drone):
         drone.set_mode("GUIDED")
@@ -801,10 +1189,11 @@ class GCSApp(tk.Tk):
         drone.arm()
         drone.wait_until_armed()
     
-    def takeoff_both(self):
-        logger.info("Takeoff both drones")
-        threading.Thread(target=self._takeoff_drone, args=(self.drone1, 6), daemon=True).start()
-        threading.Thread(target=self._takeoff_drone, args=(self.drone2, 10), daemon=True).start()
+    def takeoff_single(self, drone):
+        """Takeoff a single drone"""
+        max_alt = self.max_altitude.get()
+        logger.info(f"Takeoff {drone.name} to {max_alt}m")
+        threading.Thread(target=self._takeoff_drone, args=(drone, max_alt), daemon=True).start()
     
     def _takeoff_drone(self, drone, alt):
         drone.set_mode("GUIDED")
@@ -813,14 +1202,301 @@ class GCSApp(tk.Tk):
         drone.wait_until_armed()
         drone.takeoff(alt)
     
-    def rtl_both(self):
-        logger.info("RTL both drones")
-        self.drone1.rtl()
-        self.drone2.rtl()
-    
     def open_survey_window(self):
-        logger.info("Opening Lawnmower Survey Window")
-        SurveyWindow(self, self.drone1, self.drone2)
+        """Open survey window"""
+        logger.info("Opening Survey Window")
+        SurveyWindow(self, self.drone1, self.drone2, self.max_altitude.get())
+    
+    def set_geofence(self, polygon):
+        """Called by survey window to sync geofence"""
+        self.geofence_polygon = polygon
+        logger.info(f"✓ Geofence synced: {len(polygon)} vertices")
+        
+        # Update map
+        if MAP_AVAILABLE and hasattr(self, 'map_widget_ref'):
+            self.map_widget_ref.visualize_geofence(polygon)
+    
+    def set_survey_pattern(self, waypoints):
+        """Called by survey window to sync pattern"""
+        self.survey_waypoints = waypoints
+        logger.info(f"✓ Pattern synced: {len(waypoints)} waypoints")
+        
+        # Update map
+        if MAP_AVAILABLE and hasattr(self, 'map_widget_ref'):
+            self.map_widget_ref.visualize_pattern(waypoints)
+        
+        self.mission_status_var.set(f"Mission: READY ({len(waypoints)} WPs)")
+    
+    def clear_survey_data(self):
+        """Called by survey window to clear data"""
+        self.survey_waypoints = []
+        self.geofence_polygon = []
+        logger.info("Survey data cleared")
+        
+        if MAP_AVAILABLE and hasattr(self, 'map_widget_ref'):
+            self.map_widget_ref.clear_survey_viz()
+        
+        self.mission_status_var.set("Mission: IDLE")
+    
+    def set_geofence(self, polygon):
+        """Called by survey window to sync geofence"""
+        self.geofence_polygon = polygon
+        logger.info(f"Geofence synced to main GCS: {len(polygon)} vertices")
+        
+        # Update map visualization
+        if MAP_AVAILABLE and hasattr(self, 'map_widget_ref'):
+            self.map_widget_ref.visualize_geofence(polygon)
+    
+    def set_survey_pattern(self, waypoints):
+        """Called by survey window to sync pattern"""
+        self.survey_waypoints = waypoints
+        logger.info(f"Survey pattern synced to main GCS: {len(waypoints)} waypoints")
+        
+        # Update map visualization  
+        if MAP_AVAILABLE and hasattr(self, 'map_widget_ref'):
+            self.map_widget_ref.visualize_pattern(waypoints)
+        
+        self.mission_status_var.set(f"Mission: READY ({len(waypoints)} WPs)")
+        
+        messagebox.showinfo(
+            "Pattern Loaded",
+            f"Survey pattern loaded!\n\n"
+            f"Waypoints: {len(waypoints)}\n\n"
+            f"Press 'START MISSION' to begin."
+        )
+    
+    def clear_survey_data(self):
+        """Called by survey window to clear data"""
+        self.survey_waypoints = []
+        self.geofence_polygon = []
+        logger.info("Survey data cleared from main GCS")
+        
+        # Clear map visualization
+        if MAP_AVAILABLE and hasattr(self, 'map_widget_ref'):
+            self.map_widget_ref.clear_survey_viz()
+        
+        self.mission_status_var.set("Mission: IDLE")
+    
+    def start_mission(self):
+        """Start the automated mission"""
+        if self.mission_active:
+            messagebox.showwarning("Mission Active", "Mission is already running!")
+            return
+        
+        if not self.survey_waypoints:
+            messagebox.showerror(
+                "No Pattern",
+                "No survey pattern loaded!\n\n"
+                "1. Open Survey Tool\n"
+                "2. Load KML file\n"
+                "3. Generate pattern\n"
+                "4. Close survey window\n"
+                "5. Press START MISSION"
+            )
+            return
+        
+        # Confirm mission start
+        response = messagebox.askyesno(
+            "Start Mission",
+            f"Start automated mission?\n\n"
+            f"Survey waypoints: {len(self.survey_waypoints)}\n"
+            f"Max altitude: {self.max_altitude.get()}m\n\n"
+            f"Drone 1 (Scout) will fly survey pattern and detect people.\n"
+            f"Drone 2 (Delivery) will deliver payloads automatically.\n\n"
+            f"Both drones will ARM and TAKEOFF automatically.\n\n"
+            f"Continue?"
+        )
+        
+        if not response:
+            return
+        
+        # Start mission thread
+        self.mission_active = True
+        self.mission_status_var.set("Mission: ACTIVE")
+        self.mission_thread = threading.Thread(target=self.run_mission, daemon=True)
+        self.mission_thread.start()
+        
+        logger.info("🚀 MISSION STARTED")
+    
+    def run_mission(self):
+        """Main mission control loop"""
+        try:
+            # 1. ARM and TAKEOFF both drones
+            logger.info("Phase 1: ARM and TAKEOFF")
+            self.mission_status_var.set("Mission: ARMING & TAKEOFF")
+            
+            max_alt = self.max_altitude.get()
+            
+            # ARM Drone 1
+            self.drone1.set_mode("GUIDED")
+            self.drone1.wait_for_mode("GUIDED")
+            self.drone1.arm()
+            self.drone1.wait_until_armed()
+            
+            # ARM Drone 2
+            self.drone2.set_mode("GUIDED")
+            self.drone2.wait_for_mode("GUIDED")
+            self.drone2.arm()
+            self.drone2.wait_until_armed()
+            
+            # Takeoff Drone 1
+            self.drone1.takeoff(max_alt)
+            time.sleep(2)
+            
+            # Takeoff Drone 2
+            self.drone2.takeoff(max_alt)
+            
+            # Wait for both to reach altitude
+            logger.info("Waiting for drones to reach altitude...")
+            time.sleep(10)
+            
+            # 2. Start Scout Drone Survey
+            logger.info("Phase 2: Scout survey pattern")
+            self.mission_status_var.set("Mission: SCOUT SURVEYING")
+            
+            # Start delivery drone monitor in background
+            threading.Thread(target=self.delivery_monitor, daemon=True).start()
+            
+            # Scout flies survey pattern
+            self.drone1.fly_waypoints_guided(self.survey_waypoints, acceptance_radius=2.0)
+            
+            # 3. Survey complete
+            logger.info("Phase 3: Survey complete")
+            self.mission_status_var.set("Mission: SURVEY COMPLETE")
+            
+            # Wait for all deliveries to complete
+            logger.info("Waiting for all deliveries to complete...")
+            time.sleep(5)
+            
+            # 4. RTL both drones
+            logger.info("Phase 4: RTL")
+            self.mission_status_var.set("Mission: RTL")
+            self.drone1.rtl()
+            self.drone2.rtl()
+            
+            # Mission complete
+            logger.info("✅ MISSION COMPLETE")
+            self.mission_status_var.set("Mission: COMPLETE")
+            self.mission_active = False
+            
+            messagebox.showinfo(
+                "Mission Complete",
+                "Mission completed successfully!\n\n"
+                f"Survey waypoints: {len(self.survey_waypoints)}\n"
+                f"People detected: {len(self.payload_queue.get_all_targets())}\n"
+                f"Deliveries: {len([t for t in self.payload_queue.get_all_targets() if t[3]])}\n\n"
+                "Both drones returning to launch."
+            )
+            
+        except Exception as e:
+            logger.error(f"Mission error: {e}")
+            self.mission_status_var.set(f"Mission: ERROR - {str(e)}")
+            self.mission_active = False
+            messagebox.showerror("Mission Error", f"Mission failed:\n{str(e)}")
+    
+    def delivery_monitor(self):
+        """Background thread to monitor and execute deliveries"""
+        logger.info("Delivery monitor started")
+        
+        while self.mission_active:
+            try:
+                # Get next undelivered target
+                target = self.payload_queue.get_next_undelivered()
+                
+                if target:
+                    person_id, lat, lon = target
+                    logger.info(f"📦 Delivery mission: Person {person_id} at ({lat:.6f}, {lon:.6f})")
+                    
+                    # Fly to target
+                    self.drone2.goto(lat, lon, self.max_altitude.get(), duration=6)
+                    
+                    # Wait until arrived
+                    timeout = time.time() + 60
+                    while time.time() < timeout:
+                        dist = self.drone2.distance_to(lat, lon)
+                        if dist and dist < 5.0:
+                            logger.info(f"✅ Delivery complete to Person {person_id}")
+                            self.payload_queue.mark_delivered(person_id)
+                            break
+                        time.sleep(1)
+                
+                time.sleep(2)  # Check for new targets every 2 seconds
+                
+            except Exception as e:
+                logger.error(f"Delivery monitor error: {e}")
+                time.sleep(2)
+        
+        logger.info("Delivery monitor stopped")
+    
+    def emergency_stop(self):
+        """Emergency stop - RTL both drones"""
+        response = messagebox.askyesno(
+            "Emergency Stop",
+            "EMERGENCY STOP\n\n"
+            "This will immediately command both drones to RTL.\n\n"
+            "Continue?"
+        )
+        
+        if response:
+            logger.warning("🚨 EMERGENCY STOP ACTIVATED")
+            self.mission_active = False
+            self.mission_status_var.set("Mission: EMERGENCY STOP")
+            self.drone1.rtl()
+            self.drone2.rtl()
+            messagebox.showinfo("Emergency Stop", "Both drones commanded to RTL")
+    
+    def center_map_on_drones(self):
+        """Manually center map on drones"""
+        if not MAP_AVAILABLE:
+            return
+        
+        try:
+            telem1 = self.drone1.get_telemetry()
+            telem2 = self.drone2.get_telemetry()
+            
+            # Get valid positions
+            positions = []
+            if telem1['lat'] != 0 and telem1['lon'] != 0:
+                positions.append((telem1['lat'], telem1['lon']))
+            if telem2['lat'] != 0 and telem2['lon'] != 0:
+                positions.append((telem2['lat'], telem2['lon']))
+            
+            if not positions:
+                messagebox.showinfo("No GPS", "Drones don't have GPS lock yet.\nWaiting for position data...")
+                return
+            
+            # Calculate center point
+            avg_lat = sum(p[0] for p in positions) / len(positions)
+            avg_lon = sum(p[1] for p in positions) / len(positions)
+            
+            # Center map
+            self.map_widget_ref.map_widget.set_position(avg_lat, avg_lon)
+            
+            # Zoom based on distance between drones
+            if len(positions) == 2:
+                lat1, lon1 = positions[0]
+                lat2, lon2 = positions[1]
+                dist = math.sqrt((lat2 - lat1)**2 + (lon2 - lon1)**2)
+                
+                # Auto zoom based on distance
+                if dist > 0.01:
+                    zoom = 13
+                elif dist > 0.005:
+                    zoom = 14
+                elif dist > 0.002:
+                    zoom = 15
+                else:
+                    zoom = 17
+                
+                self.map_widget_ref.map_widget.set_zoom(zoom)
+            else:
+                self.map_widget_ref.map_widget.set_zoom(17)
+            
+            logger.info(f"Map centered on drones: {avg_lat:.6f}, {avg_lon:.6f}")
+            
+        except Exception as e:
+            logger.error(f"Center map error: {e}")
+            messagebox.showerror("Error", f"Failed to center map: {e}")
 
 # -------------------------------
 # Run App
