@@ -384,6 +384,43 @@ class Drone:
         except Exception as e:
             logger.error(f"[{self.name}] RTL failed: {e}")
 
+    def drop_payload(self):
+        """Drop payload using servo mechanism on AUX OUT 1 (Channel 9)"""
+        try:
+            logger.info(f"[{self.name}] 📦 Activating payload release servo")
+            
+            # OPEN SERVO (Release position)
+            self.master.mav.command_long_send(
+                self.master.target_system,
+                self.master.target_component,
+                mavutil.mavlink.MAV_CMD_DO_SET_SERVO,
+                0,              # Confirmation
+                9,              # Servo channel (AUX OUT 1 = Channel 9)
+                2000,           # PWM value (2000 μs = fully open)
+                0, 0, 0, 0, 0   # Unused parameters
+            )
+            
+            logger.info(f"[{self.name}] ✅ Servo OPEN - Payload released!")
+            time.sleep(2.0)  # Wait 2 seconds for servo to move and payload to drop
+            
+            # CLOSE SERVO (Reset to secure position)
+            self.master.mav.command_long_send(
+                self.master.target_system,
+                self.master.target_component,
+                mavutil.mavlink.MAV_CMD_DO_SET_SERVO,
+                0,
+                9,              # Servo channel
+                1000,           # PWM value (1000 μs = fully closed)
+                0, 0, 0, 0, 0
+            )
+            
+            logger.info(f"[{self.name}] Servo CLOSED - Ready for next payload")
+            return True
+            
+        except Exception as e:
+            logger.error(f"[{self.name}] ❌ Payload drop failed: {e}")
+            return False
+
     def start_telemetry_listener(self):
         """Background thread for telemetry monitoring"""
         def listener():
@@ -1095,6 +1132,23 @@ class GCSApp(tk.Tk):
         ttk.Button(d2_frame, text="TAKEOFF", command=lambda: self.takeoff_single(self.drone2), width=10).pack(side=tk.LEFT, padx=2)
         ttk.Button(d2_frame, text="RTL", command=lambda: self.drone2.rtl(), width=10).pack(side=tk.LEFT, padx=2)
         
+         # Payload test controls
+        payload_frame = ttk.Frame(preflight_frame)
+        payload_frame.pack(fill=tk.X, pady=5)
+        ttk.Label(payload_frame, text="Payload Test:", font=("Arial", 9, "bold")).pack(side=tk.LEFT, padx=5)
+        ttk.Button(
+            payload_frame, 
+            text="🧪 TEST SERVO", 
+            command=self.test_payload_servo,
+            width=15
+        ).pack(side=tk.LEFT, padx=2)
+        ttk.Label(
+            payload_frame, 
+            text="(Ground test - no flight required)", 
+            font=("Arial", 7), 
+            foreground="gray"
+        ).pack(side=tk.LEFT, padx=5)
+
         # === MAIN MISSION CONTROLS ===
         mission_frame = ttk.LabelFrame(control_frame, text="Main Mission")
         mission_frame.pack(fill=tk.X, padx=5, pady=5)
@@ -1201,20 +1255,144 @@ class GCSApp(tk.Tk):
         drone.arm()
         drone.wait_until_armed()
         drone.takeoff(alt)
+
+    def test_payload_servo(self):
+        """Test payload servo mechanism (ground test)"""
+        # Check if Drone 2 is connected
+        if not self.drone2.master:
+            messagebox.showerror(
+                "Not Connected",
+                "Drone 2 (Delivery) is not connected!\n\n"
+                "Please connect Drone 2 first using 'Auto-Connect Drone 2'"
+            )
+            return
+        
+        # Confirmation dialog
+        response = messagebox.askyesno(
+            "Test Payload Servo",
+            "This will test the payload release servo.\n\n"
+            "⚠️ Make sure:\n"
+            "• Drone 2 is connected\n"
+            "• Servo is connected to AUX OUT 1\n"
+            "• Payload mechanism is ready\n"
+            "• NO propellers installed (ground test)\n\n"
+            "The servo will:\n"
+            "1. Open (release position)\n"
+            "2. Wait 2 seconds\n"
+            "3. Close (secure position)\n\n"
+            "Continue?"
+        )
+        
+        if not response:
+            return
+        
+        # Run test in separate thread
+        threading.Thread(
+            target=self._run_servo_test, 
+            daemon=True
+        ).start()
+    
+    def _run_servo_test(self):
+        """Execute servo test sequence"""
+        try:
+            logger.info("🧪 Starting payload servo test...")
+            
+            # Update status
+            self.mission_status_var.set("Testing: SERVO")
+            
+            # Step 1: Close position (secure)
+            logger.info("Step 1: Moving servo to CLOSED position (PWM 1000)")
+            self.drone2.master.mav.command_long_send(
+                self.drone2.master.target_system,
+                self.drone2.master.target_component,
+                mavutil.mavlink.MAV_CMD_DO_SET_SERVO,
+                0,
+                9,      # Channel 9 (AUX OUT 1)
+                1000,   # PWM 1000 (closed)
+                0, 0, 0, 0, 0
+            )
+            
+            self.after(0, lambda: messagebox.showinfo(
+                "Servo Test - Step 1",
+                "✅ Servo moved to CLOSED position (PWM 1000)\n\n"
+                "Check: Payload should be SECURED\n\n"
+                "Next: Opening servo in 3 seconds..."
+            ))
+            
+            time.sleep(3)
+            
+            # Step 2: Open position (release)
+            logger.info("Step 2: Moving servo to OPEN position (PWM 2000)")
+            self.drone2.master.mav.command_long_send(
+                self.drone2.master.target_system,
+                self.drone2.master.target_component,
+                mavutil.mavlink.MAV_CMD_DO_SET_SERVO,
+                0,
+                9,      # Channel 9
+                2000,   # PWM 2000 (open)
+                0, 0, 0, 0, 0
+            )
+            
+            self.after(0, lambda: messagebox.showinfo(
+                "Servo Test - Step 2",
+                "✅ Servo moved to OPEN position (PWM 2000)\n\n"
+                "Check: Payload should be RELEASED\n\n"
+                "Holding for 2 seconds..."
+            ))
+            
+            time.sleep(2)
+            
+            # Step 3: Return to closed
+            logger.info("Step 3: Returning servo to CLOSED position")
+            self.drone2.master.mav.command_long_send(
+                self.drone2.master.target_system,
+                self.drone2.master.target_component,
+                mavutil.mavlink.MAV_CMD_DO_SET_SERVO,
+                0,
+                9,
+                1000,   # Back to closed
+                0, 0, 0, 0, 0
+            )
+            
+            logger.info("✅ Servo test complete!")
+            
+            # Reset status
+            self.mission_status_var.set("Mission: IDLE")
+            
+            # Final message
+            self.after(0, lambda: messagebox.showinfo(
+                "Servo Test Complete",
+                "✅ Servo test completed successfully!\n\n"
+                "Test sequence:\n"
+                "1. ✓ Closed position (1000 μs)\n"
+                "2. ✓ Open position (2000 μs)\n"
+                "3. ✓ Returned to closed\n\n"
+                "If servo moved correctly:\n"
+                "• PWM 1000 = Payload SECURED\n"
+                "• PWM 2000 = Payload RELEASED\n\n"
+                "If servo moved backwards,\n"
+                "set SERVO9_REVERSED = 1 in parameters."
+            ))
+            
+        except Exception as e:
+            logger.error(f"Servo test failed: {e}")
+            self.mission_status_var.set("Mission: IDLE")
+            self.after(0, lambda: messagebox.showerror(
+                "Servo Test Failed",
+                f"❌ Servo test failed!\n\n"
+                f"Error: {str(e)}\n\n"
+                f"Check:\n"
+                f"• Drone 2 is connected\n"
+                f"• Servo connected to AUX OUT 1\n"
+                f"• SERVO9_FUNCTION = 1\n"
+                f"• Check logs for details"
+            ))
     
     def open_survey_window(self):
         """Open survey window"""
         logger.info("Opening Survey Window")
         SurveyWindow(self, self.drone1, self.drone2, self.max_altitude.get())
     
-    def set_geofence(self, polygon):
-        """Called by survey window to sync geofence"""
-        self.geofence_polygon = polygon
-        logger.info(f"✓ Geofence synced: {len(polygon)} vertices")
-        
-        # Update map
-        if MAP_AVAILABLE and hasattr(self, 'map_widget_ref'):
-            self.map_widget_ref.visualize_geofence(polygon)
     
     def set_survey_pattern(self, waypoints):
         """Called by survey window to sync pattern"""
@@ -1395,38 +1573,94 @@ class GCSApp(tk.Tk):
             messagebox.showerror("Mission Error", f"Mission failed:\n{str(e)}")
     
     def delivery_monitor(self):
-        """Background thread to monitor and execute deliveries"""
-        logger.info("Delivery monitor started")
+        """Background thread to monitor and execute deliveries with servo payload drop"""
+        logger.info("🚁 Delivery monitor started")
         
         while self.mission_active:
             try:
-                # Get next undelivered target
+                # Get next undelivered target from queue
                 target = self.payload_queue.get_next_undelivered()
                 
                 if target:
                     person_id, lat, lon = target
-                    logger.info(f"📦 Delivery mission: Person {person_id} at ({lat:.6f}, {lon:.6f})")
+                    logger.info(f"📦 Starting delivery to Person {person_id} at ({lat:.6f}, {lon:.6f})")
                     
-                    # Fly to target
+                    # Update mission status in UI
+                    self.mission_status_var.set(f"Mission: DELIVERING to Person {person_id}")
+                    
+                    # Fly to target location
+                    logger.info(f"Flying to Person {person_id}...")
                     self.drone2.goto(lat, lon, self.max_altitude.get(), duration=6)
                     
-                    # Wait until arrived
-                    timeout = time.time() + 60
+                    # Wait for arrival (within 5m radius)
+                    timeout = time.time() + 60  # 60 second timeout
+                    arrived = False
+                    
                     while time.time() < timeout:
+                        # Check if mission was aborted
+                        if not self.mission_active:
+                            logger.warning("⚠️ Mission aborted during delivery")
+                            return
+                        
+                        # Check distance to target
                         dist = self.drone2.distance_to(lat, lon)
-                        if dist and dist < 5.0:
-                            logger.info(f"✅ Delivery complete to Person {person_id}")
-                            self.payload_queue.mark_delivered(person_id)
-                            break
+                        if dist is not None:
+                            logger.debug(f"Distance to Person {person_id}: {dist:.1f}m")
+                            
+                            if dist < 5.0:  # Within 5 meters = arrived
+                                logger.info(f"✅ Arrived at Person {person_id} (distance: {dist:.1f}m)")
+                                arrived = True
+                                break
+                        
                         time.sleep(1)
+                    
+                    if arrived:
+                        # Stabilization hover before drop
+                        logger.info(f"Hovering to stabilize before payload drop...")
+                        time.sleep(3)  # 3 second stabilization
+                        
+                        # DROP PAYLOAD VIA SERVO
+                        logger.info(f"📦 Dropping payload to Person {person_id}")
+                        drop_success = self.drone2.drop_payload()
+                        
+                        if drop_success:
+                            # Mark as delivered in queue
+                            self.payload_queue.mark_delivered(person_id)
+                            logger.info(f"✅ Delivery complete to Person {person_id}")
+                            
+                            # Show UI notification (thread-safe)
+                            self.after(0, lambda pid=person_id: messagebox.showinfo(
+                                "Delivery Complete",
+                                f"✅ Payload delivered to Person {pid}!\n\n"
+                                f"Servo activated successfully."
+                            ))
+                            
+                            # Brief pause before next delivery
+                            time.sleep(3)
+                        else:
+                            logger.error(f"❌ Payload drop failed for Person {person_id}")
+                            self.after(0, lambda pid=person_id: messagebox.showerror(
+                                "Delivery Failed",
+                                f"❌ Failed to drop payload to Person {pid}\n\n"
+                                f"Check servo connection and try again."
+                            ))
+                    else:
+                        logger.warning(f"⚠️ Timeout reaching Person {person_id} - Skipping delivery")
+                        self.after(0, lambda pid=person_id: messagebox.showwarning(
+                            "Delivery Timeout",
+                            f"⚠️ Could not reach Person {pid} within 60 seconds\n\n"
+                            f"Moving to next target."
+                        ))
                 
-                time.sleep(2)  # Check for new targets every 2 seconds
-                
+                else:
+                    # No targets in queue - wait
+                    time.sleep(2)
+                    
             except Exception as e:
-                logger.error(f"Delivery monitor error: {e}")
+                logger.error(f"❌ Delivery monitor error: {e}")
                 time.sleep(2)
         
-        logger.info("Delivery monitor stopped")
+        logger.info("🛑 Delivery monitor stopped")
     
     def emergency_stop(self):
         """Emergency stop - RTL both drones"""
