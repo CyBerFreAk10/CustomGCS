@@ -41,6 +41,9 @@ class CameraSpecs:
             'altitude': altitude_m
         }
 
+# =====================================================
+# LAWNMOWER PATTERN GENERATOR (Centroid Aligned)
+# =====================================================
 class LawnmowerPattern:
 
     @staticmethod
@@ -218,8 +221,6 @@ class LawnmowerPattern:
             
             # Clean up intersections (group by proximity to avoid tiny zig-zags on vertices)
             if len(intersections) >= 2:
-                # Basic logic: take min and max x for this line (simple sweep)
-                # Or handle complex polygons (holes):
                 for i in range(0, len(intersections) - 1, 2):
                     x1, x2 = intersections[i], intersections[i+1]
                     
@@ -243,7 +244,6 @@ class LawnmowerPattern:
 
         return final_waypoints
 
-    # --- THIS WAS MISSING AND CAUSED THE ERROR ---
     @staticmethod
     def calculate_polygon_size(polygon):
         """Estimate size for UI display"""
@@ -253,7 +253,6 @@ class LawnmowerPattern:
         lons = [p[1] for p in polygon]
         avg_lat = sum(lats) / len(lats)
         
-        # Approximate conversion (1 deg lat ~ 111.32km)
         lat_span = (max(lats) - min(lats)) * 111320
         lon_span = (max(lons) - min(lons)) * 111320 * math.cos(math.radians(avg_lat))
         
@@ -264,17 +263,19 @@ class LawnmowerPattern:
 
     @staticmethod
     def calculate_pattern_stats(waypoints):
-        if len(waypoints) < 2: return {"total_distance": 0, "num_waypoints": len(waypoints)}
+        # Filter out RTL command if present
+        valid_wps = [wp for wp in waypoints if isinstance(wp[0], (int, float))]
+        
+        if len(valid_wps) < 2: return {"total_distance": 0, "num_waypoints": len(waypoints)}
         total_dist = 0
         R = 6378137.0
-        for i in range(len(waypoints)-1):
-            lat1, lon1, _ = waypoints[i]
-            lat2, lon2, _ = waypoints[i+1]
+        for i in range(len(valid_wps)-1):
+            lat1, lon1, _ = valid_wps[i]
+            lat2, lon2, _ = valid_wps[i+1]
             a = math.sin(math.radians(lat2-lat1)/2)**2 + math.cos(math.radians(lat1))*math.cos(math.radians(lat2))*math.sin(math.radians(lon2-lon1)/2)**2
             total_dist += R * 2 * math.atan2(math.sqrt(a), math.sqrt(1-a))
         return {"total_distance": total_dist, "num_waypoints": len(waypoints)}
-    
-    
+
 # =====================================================
 # SURVEY WINDOW
 # =====================================================
@@ -282,7 +283,7 @@ class SurveyWindow(tk.Toplevel):
 
     def __init__(self, parent, drone1, drone2, max_altitude=6.0):
         super().__init__(parent)
-        self.title("Survey Pattern Generator")
+        self.title("Survey Pattern Generator (VTOL Mode)")
         self.geometry("1200x800")
         
         self.parent = parent
@@ -301,8 +302,8 @@ class SurveyWindow(tk.Toplevel):
 
     def create_ui(self):
         # Title
-        ttk.Label(self, text="🗺️ Survey Pattern Generator", font=("Arial", 16, "bold")).pack(pady=10)
-        ttk.Label(self, text="Generate pattern here. It will sync to main GCS automatically.", 
+        ttk.Label(self, text="🗺️ Survey Pattern Generator (VTOL)", font=("Arial", 16, "bold")).pack(pady=10)
+        ttk.Label(self, text="Includes Auto-RTL and Geofence Safety Buffers.", 
                   font=("Arial", 10, "italic"), foreground="blue").pack(pady=5)
 
         # Main layout
@@ -338,16 +339,17 @@ class SurveyWindow(tk.Toplevel):
         ttk.Entry(params_frame, textvariable=self.overlap, width=10).grid(row=1, column=1, padx=5)
 
         ttk.Label(params_frame, text="Buffer (m):").grid(row=2, column=0, sticky="w", pady=5, padx=5)
-        self.geofence_buffer = tk.DoubleVar(value=0.0)
+        # CHANGED: Default buffer to 2.0m for VTOL safety (avoids edge-clipping)
+        self.geofence_buffer = tk.DoubleVar(value=2.0)
         ttk.Entry(params_frame, textvariable=self.geofence_buffer, width=10).grid(row=2, column=1, padx=5)
         
         # Quick buttons
         buffer_btn_frame = ttk.Frame(params_frame)
         buffer_btn_frame.grid(row=3, column=0, columnspan=3, pady=5)
         ttk.Label(buffer_btn_frame, text="Quick:", font=("Arial", 8)).pack(side=tk.LEFT, padx=5)
-        ttk.Button(buffer_btn_frame, text="0m", width=6, command=lambda: self.geofence_buffer.set(0.0)).pack(side=tk.LEFT, padx=2)
-        ttk.Button(buffer_btn_frame, text="0.5m", width=6, command=lambda: self.geofence_buffer.set(0.5)).pack(side=tk.LEFT, padx=2)
-        ttk.Button(buffer_btn_frame, text="1m", width=6, command=lambda: self.geofence_buffer.set(1.0)).pack(side=tk.LEFT, padx=2)
+        ttk.Button(buffer_btn_frame, text="1.0m", width=6, command=lambda: self.geofence_buffer.set(1.0)).pack(side=tk.LEFT, padx=2)
+        ttk.Button(buffer_btn_frame, text="2.0m", width=6, command=lambda: self.geofence_buffer.set(2.0)).pack(side=tk.LEFT, padx=2)
+        ttk.Button(buffer_btn_frame, text="3.0m", width=6, command=lambda: self.geofence_buffer.set(3.0)).pack(side=tk.LEFT, padx=2)
 
         self.spacing_info = ttk.Label(params_frame, text="Auto-calculated spacing", 
                                       font=("Arial", 9, "italic"), foreground="green")
@@ -359,7 +361,7 @@ class SurveyWindow(tk.Toplevel):
         self.stats_label.grid(row=6, column=0, columnspan=3)
 
         # Table
-        table_frame = ttk.LabelFrame(left_panel, text="3. Waypoints", padding=10)
+        table_frame = ttk.LabelFrame(left_panel, text="3. Waypoints (Auto RTL)", padding=10)
         table_frame.pack(fill="both", expand=True, padx=10, pady=5)
 
         self.table = ttk.Treeview(table_frame, columns=("idx", "lat", "lon", "alt"), 
@@ -429,34 +431,45 @@ class SurveyWindow(tk.Toplevel):
             
             self.spacing_info.config(text=f"✓ Spacing: {spacing:.1f}m")
             
-            # Generate
-            self.pattern_wps = LawnmowerPattern.lawnmower_from_polygon(
+            # Generate Basic Pattern
+            raw_wps = LawnmowerPattern.lawnmower_from_polygon(
                 self.polygon, spacing, alt, self.geofence_buffer.get()
             )
             
-            stats = LawnmowerPattern.calculate_pattern_stats(self.pattern_wps)
+            # Calculate Stats BEFORE adding RTL (so RTL doesn't break math)
+            stats = LawnmowerPattern.calculate_pattern_stats(raw_wps)
+            
+            # ADD RTL COMMAND TO END OF LIST
+            # We use a special tuple structure ("RTL", "RTL", 0) to flag it
+            self.pattern_wps = raw_wps + [("RTL", "RTL", 0)]
             
             # Update table
             self.table.delete(*self.table.get_children())
             for i, (lat, lon, a) in enumerate(self.pattern_wps, 1):
-                self.table.insert("", "end", values=(i, f"{lat:.7f}", f"{lon:.7f}", f"{a:.1f}"))
+                # Handle Display for RTL command
+                if lat == "RTL":
+                    self.table.insert("", "end", values=(i, "RETURN", "TO LAUNCH", "--"))
+                else:
+                    self.table.insert("", "end", values=(i, f"{lat:.7f}", f"{lon:.7f}", f"{a:.1f}"))
             
             self.stats_label.config(
-                text=f"✓ {stats['num_waypoints']} WPs | {stats['total_distance']:.0f}m",
+                text=f"✓ {stats['num_waypoints']} WPs + RTL | {stats['total_distance']:.0f}m",
                 foreground="green"
             )
             
             if MAP_AVAILABLE:
                 self.visualize_pattern()
             
-            # Sync to main GCS
+            # Sync to main GCS (filter out RTL command for visualization)
             if hasattr(self.parent, 'set_survey_pattern'):
-                self.parent.set_survey_pattern(self.pattern_wps)
+                # Send only valid waypoints (exclude RTL command)
+                visual_wps = [wp for wp in self.pattern_wps if wp[0] != "RTL"]
+                self.parent.set_survey_pattern(visual_wps)
             
             messagebox.showinfo("Success", 
-                f"Pattern: {stats['num_waypoints']} waypoints\n"
-                f"Distance: {stats['total_distance']:.0f}m\n"
-                f"Time: ~{stats['total_distance']/5/60:.1f} min")
+                f"Pattern Generated!\n"
+                f"Waypoints: {stats['num_waypoints']} + RTL\n"
+                f"Est Distance: {stats['total_distance']:.0f}m")
             
         except Exception as e:
             logger.error(f"Generate error: {e}")
@@ -505,18 +518,22 @@ class SurveyWindow(tk.Toplevel):
             if self.pattern_path:
                 self.pattern_path.delete()
             
-            coords = [(lat, lon) for lat, lon, _ in self.pattern_wps]
-            self.pattern_path = self.map_widget.set_path(coords, color="blue", width=2)
+            # Filter out "RTL" for map plotting
+            plot_coords = [(lat, lon) for lat, lon, _ in self.pattern_wps if lat != "RTL"]
             
-            if len(self.pattern_wps) > 0:
-                lat, lon, _ = self.pattern_wps[0]
+            if plot_coords:
+                self.pattern_path = self.map_widget.set_path(plot_coords, color="blue", width=2)
+                
+                # Start Marker
+                lat, lon = plot_coords[0]
                 m = self.map_widget.set_marker(lat, lon, text="START", marker_color_circle="green")
                 self.waypoint_markers.append(m)
-            
-            if len(self.pattern_wps) > 1:
-                lat, lon, _ = self.pattern_wps[-1]
-                m = self.map_widget.set_marker(lat, lon, text="END", marker_color_circle="orange")
+                
+                # End Marker (The last actual survey point before RTL)
+                lat, lon = plot_coords[-1]
+                m = self.map_widget.set_marker(lat, lon, text="END (->RTL)", marker_color_circle="orange")
                 self.waypoint_markers.append(m)
+
         except Exception as e:
             logger.error(f"Pattern viz error: {e}")
 
